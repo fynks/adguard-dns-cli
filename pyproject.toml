@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agdns-cli"
+version = "1.0.0"
+description = "Pull blocked DNS requests per device from the AdGuard DNS API"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+dependencies = []
+keywords = ["adguard", "dns", "cli", "query-log"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Internet :: Name Service (DNS)",
+    "Topic :: System :: Networking :: Monitoring",
+]
+
+[project.scripts]
+agdns = "agdns.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["agdns*"]
