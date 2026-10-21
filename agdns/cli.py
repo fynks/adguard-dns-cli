@@ -1,14 +1,13 @@
 """Command line interface for the AdGuard DNS CLI."""
 
-from __future__ import annotations
-
 import argparse
 import csv
 import json
 import os
 import sys
-from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, Sequence
+from collections.abc import Iterable, Sequence
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from .api import (
     BLOCKED_STATUSES,
@@ -48,7 +47,7 @@ def _client(args: argparse.Namespace) -> AdGuardDNSClient:
 
 
 def _time_range(args: argparse.Namespace) -> tuple[int, int]:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     if args.since:
         start = _parse_time(args.since)
     else:
@@ -61,9 +60,10 @@ def _parse_time(value: str) -> datetime:
     value = value.strip()
     if value.isdigit():
         seconds = int(value)
-        return datetime.fromtimestamp(seconds, tz=timezone.utc)
+        return datetime.fromtimestamp(seconds, tz=UTC)
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        # Python 3.11+ parses both "Z" and "+00:00" suffixes natively.
+        return datetime.fromisoformat(value)
     except ValueError as exc:
         raise SystemExit(f'Invalid time "{value}". Use YYYY-MM-DD or an ISO-8601 timestamp.') from exc
 
@@ -71,7 +71,7 @@ def _parse_time(value: str) -> datetime:
 def _fmt_time(millis: int) -> str:
     if not millis:
         return ""
-    return datetime.fromtimestamp(millis / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.fromtimestamp(millis / 1000, tz=UTC).strftime("%Y-%m-%d %H:%M:%S")
 
 
 # -- output ----------------------------------------------------------------

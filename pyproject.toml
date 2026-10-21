@@ -7,7 +7,7 @@ name = "agdns-cli"
 version = "1.0.0"
 description = "Pull blocked DNS requests per device from the AdGuard DNS API"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 license = { file = "LICENSE" }
 dependencies = []
 keywords = ["adguard", "dns", "cli", "query-log"]
@@ -17,6 +17,9 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Internet :: Name Service (DNS)",
     "Topic :: System :: Networking :: Monitoring",
 ]

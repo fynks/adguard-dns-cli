@@ -8,7 +8,7 @@ cursors automatically.
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.12+
 - An AdGuard DNS account (Private DNS) with an API key
 - Query log access on the account
 
@@ -41,7 +41,6 @@ pip install -e .            # or: pipx install .
 # or run it without installing:
 python -m agdns --help
 ```
-
 ## Setup
 
 Create an API key in *AdGuard DNS → User preferences → API keys*, then:

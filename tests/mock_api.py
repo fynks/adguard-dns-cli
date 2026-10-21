@@ -1,7 +1,5 @@
 """Mock AdGuard DNS API server used by the test suite."""
 
-from __future__ import annotations
-
 import gzip
 import json
 import threading

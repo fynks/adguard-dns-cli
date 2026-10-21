@@ -6,19 +6,21 @@ Only the endpoints needed by this CLI are implemented:
 - ``GET /oapi/v1/query_log`` -- fetch query log entries for a time range.
 """
 
-from __future__ import annotations
-
 import gzip
 import http.client
 import json
 import time
 import urllib.error
 import urllib.parse
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Any, Iterator
+from typing import Any
 
 DEFAULT_TIMEOUT = 60.0
 DEFAULT_PAGE_LIMIT = 1000
+
+# A decoded JSON object as returned by the API.
+type JsonObject = dict[str, Any]
 
 # Filtering statuses reported by the API.
 STATUS_REQUEST_BLOCKED = "REQUEST_BLOCKED"
@@ -43,10 +45,10 @@ class Device:
     name: str
     dns_server_id: str = ""
     device_type: str = ""
-    raw: dict[str, Any] = field(default_factory=dict)
+    raw: JsonObject = field(default_factory=dict)
 
     @classmethod
-    def from_json(cls, data: dict[str, Any]) -> Device:
+    def from_json(cls, data: JsonObject) -> Device:
         return cls(
             id=str(data.get("id", "")),
             name=str(data.get("name", "")),
@@ -75,10 +77,10 @@ class QueryLogItem:
     blocked_service_id: str
     client_country: str
     response_country: str
-    raw: dict[str, Any] = field(default_factory=dict)
+    raw: JsonObject = field(default_factory=dict)
 
     @classmethod
-    def from_json(cls, data: dict[str, Any]) -> QueryLogItem:
+    def from_json(cls, data: JsonObject) -> QueryLogItem:
         info = data.get("filtering_info") or {}
         return cls(
             time_millis=int(data.get("time_millis") or 0),
@@ -111,7 +113,7 @@ def _retry_delay(headers: dict[str, str], attempt: int) -> float:
     return min(2**attempt, 8)
 
 
-def _next_page_cursor(pages: list[dict[str, Any]]) -> str | None:
+def _next_page_cursor(pages: list[JsonObject]) -> str | None:
     """Pick the cursor of the page following the current one.
 
     The API returns a list of page descriptors, each with a page number and a
@@ -243,7 +245,7 @@ class AdGuardDNSClient:
             headers["X-Account-Id"] = str(self.account_id)
         return headers
 
-    def _request(self, path: str, params: dict[str, Any] | None = None) -> Any:
+    def _request(self, path: str, params: JsonObject | None = None) -> Any:
         if params:
             # ``None`` values are skipped, lists are repeated (Go style).
             pairs: list[tuple[str, str]] = []

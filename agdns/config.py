@@ -4,8 +4,6 @@ The API key is stored in a JSON file inside the user's config directory with
 restrictive permissions (0600 for the file, 0700 for the directory).
 """
 
-from __future__ import annotations
-
 import json
 import os
 import stat
