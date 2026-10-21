@@ -37,11 +37,14 @@ def _client(args: argparse.Namespace) -> AdGuardDNSClient:
             "  Set one with:  agdns config set-key <API_KEY>\n"
             f"  Or export {config.ENV_API_KEY}=<API_KEY>."
         )
-    return AdGuardDNSClient(
+    client = AdGuardDNSClient(
         api_key=api_key,
         api_url=config.get_api_url(),
         account_id=getattr(args, "account_id", None),
     )
+    # Stashed so main() can release the pooled connection on any exit path.
+    setattr(args, "_client", client)
+    return client
 
 
 def _time_range(args: argparse.Namespace) -> tuple[int, int]:
@@ -102,43 +105,47 @@ def _print_table(items: Sequence[QueryLogItem]) -> None:
         print(line(row))
 
 
-def _print_csv(items: Sequence[QueryLogItem], stream: Any) -> None:
+CSV_HEADER = [
+    "time_iso",
+    "time_millis",
+    "domain",
+    "device_id",
+    "status",
+    "category",
+    "company",
+    "filter_id",
+    "filter_rule",
+    "filtering_category_id",
+    "blocked_service_id",
+    "client_country",
+    "response_country",
+]
+
+
+def _csv_row(item: QueryLogItem) -> list[Any]:
+    return [
+        item.time_iso,
+        item.time_millis,
+        item.domain,
+        item.device_id,
+        item.filtering_status,
+        item.category_type,
+        item.company_id,
+        item.filter_id,
+        item.filter_rule,
+        item.filtering_category_id,
+        item.blocked_service_id,
+        item.client_country,
+        item.response_country,
+    ]
+
+
+def _print_csv(items: Iterable[QueryLogItem], stream: Any) -> None:
+    """Write CSV rows as they arrive, so memory stays flat."""
     writer = csv.writer(stream)
-    writer.writerow(
-        [
-            "time_iso",
-            "time_millis",
-            "domain",
-            "device_id",
-            "status",
-            "category",
-            "company",
-            "filter_id",
-            "filter_rule",
-            "filtering_category_id",
-            "blocked_service_id",
-            "client_country",
-            "response_country",
-        ]
-    )
+    writer.writerow(CSV_HEADER)
     for item in items:
-        writer.writerow(
-            [
-                item.time_iso,
-                item.time_millis,
-                item.domain,
-                item.device_id,
-                item.filtering_status,
-                item.category_type,
-                item.company_id,
-                item.filter_id,
-                item.filter_rule,
-                item.filtering_category_id,
-                item.blocked_service_id,
-                item.client_country,
-                item.response_country,
-            ]
-        )
+        writer.writerow(_csv_row(item))
 
 
 def _print_json(payload: Any, stream: Any) -> None:
@@ -146,20 +153,32 @@ def _print_json(payload: Any, stream: Any) -> None:
     stream.write("\n")
 
 
-def _summary(items: Sequence[QueryLogItem]) -> dict[str, Any]:
-    by_domain: dict[str, int] = {}
-    by_category: dict[str, int] = {}
-    by_status: dict[str, int] = {}
-    for item in items:
-        by_domain[item.domain] = by_domain.get(item.domain, 0) + 1
-        by_category[item.category_type or "UNKNOWN"] = by_category.get(item.category_type or "UNKNOWN", 0) + 1
-        by_status[item.filtering_status or "UNKNOWN"] = by_status.get(item.filtering_status or "UNKNOWN", 0) + 1
-    return {
-        "total": len(items),
-        "by_status": dict(sorted(by_status.items(), key=lambda kv: -kv[1])),
-        "by_category": dict(sorted(by_category.items(), key=lambda kv: -kv[1])),
-        "by_domain": dict(sorted(by_domain.items(), key=lambda kv: (-kv[1], kv[0]))),
-    }
+class _Accumulator:
+    """Collects aggregate counts while records stream past."""
+
+    def __init__(self) -> None:
+        self.total = 0
+        self.by_status: dict[str, int] = {}
+        self.by_category: dict[str, int] = {}
+        self.by_domain: dict[str, int] = {}
+
+    def add(self, item: QueryLogItem) -> None:
+        self.total += 1
+        status = item.filtering_status or "UNKNOWN"
+        category = item.category_type or "UNKNOWN"
+        self.by_status[status] = self.by_status.get(status, 0) + 1
+        self.by_category[category] = self.by_category.get(category, 0) + 1
+        self.by_domain[item.domain] = self.by_domain.get(item.domain, 0) + 1
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "total": self.total,
+            "by_status": dict(sorted(self.by_status.items(), key=lambda kv: -kv[1])),
+            "by_category": dict(sorted(self.by_category.items(), key=lambda kv: -kv[1])),
+            "by_domain": dict(
+                sorted(self.by_domain.items(), key=lambda kv: (-kv[1], kv[0]))
+            ),
+        }
 
 
 # -- commands --------------------------------------------------------------
@@ -209,6 +228,7 @@ def cmd_config(args: argparse.Namespace) -> int:
 def cmd_devices(args: argparse.Namespace) -> int:
     client = _client(args)
     devices = client.list_devices(search=args.search)
+    client.close()
     if args.format == "json":
         _print_json([d.raw for d in devices], sys.stdout)
         return 0
@@ -234,8 +254,7 @@ def cmd_blocked(args: argparse.Namespace) -> int:
             device_ids.append(device.id)
 
     statuses = args.status if args.status else list(BLOCKED_STATUSES)
-    items: list[QueryLogItem] = []
-    for item in client.iter_query_log(
+    records = client.iter_query_log(
         time_from_millis=time_from,
         time_to_millis=time_to,
         devices=device_ids,
@@ -243,8 +262,20 @@ def cmd_blocked(args: argparse.Namespace) -> int:
         search=args.search,
         limit=args.page_size,
         max_items=args.max_records,
-    ):
+    )
+
+    if args.format == "csv":
+        # Stream straight to disk: memory stays flat regardless of log size.
+        _print_csv(records, sys.stdout)
+        client.close()
+        return 0
+
+    acc = _Accumulator()
+    items: list[QueryLogItem] = []
+    for item in records:
+        acc.add(item)
         items.append(item)
+    client.close()
 
     if args.format == "json":
         payload: Any = {
@@ -254,28 +285,24 @@ def cmd_blocked(args: argparse.Namespace) -> int:
             "time_from_millis": time_from,
             "time_to_millis": time_to,
             "statuses": statuses,
-            "count": len(items),
+            "count": acc.total,
             "items": [item.raw for item in items],
         }
         if args.summary:
-            payload["summary"] = _summary(items)
+            payload["summary"] = acc.as_dict()
         _print_json(payload, sys.stdout)
-        return 0
-
-    if args.format == "csv":
-        _print_csv(items, sys.stdout)
         return 0
 
     # table
     device_label = ", ".join(d.name for d in devices_info)
     print(
         f"Blocked queries for {device_label} "
-        f"({_fmt_time(time_from)} .. {_fmt_time(time_to)}): {len(items)}"
+        f"({_fmt_time(time_from)} .. {_fmt_time(time_to)}): {acc.total}"
     )
     _print_table(items)
 
     if args.summary:
-        summary = _summary(items)
+        summary = acc.as_dict()
         print()
         print("Summary by category:")
         for name, count in summary["by_category"].items():
@@ -372,6 +399,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 1
     except KeyboardInterrupt:  # pragma: no cover
         return 130
+    finally:
+        # Release the pooled keep-alive connection.
+        client = getattr(args, "_client", None)
+        if client is not None:
+            client.close()
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 API_KEY = "test-api-key"
+
+# Every request the mock receives, for assertions.
+REQUESTS: list[dict] = []
 
 DEVICES = [
     {
@@ -83,20 +87,36 @@ PAGE_TWO = [
 
 
 class Handler(BaseHTTPRequestHandler):
+    # HTTP/1.1 enables keep-alive, matching the real API.
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, *args):  # silence the server
         pass
 
-    def _send(self, status: int, payload):
+    def _send(self, status: int, payload, headers: dict[str, str] | None = None):
         body = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        if "gzip" in (self.headers.get("Accept-Encoding") or ""):
+            body = gzip.compress(body)
+            self.send_header("Content-Encoding", "gzip")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self):
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
+        REQUESTS.append(
+            {
+                "path": parsed.path,
+                "query": query,
+                "accept_encoding": self.headers.get("Accept-Encoding"),
+                "connection": self.headers.get("Connection"),
+            }
+        )
 
         if self.headers.get("Authorization") != f"ApiKey {API_KEY}":
             self.send_response(401)
@@ -117,6 +137,7 @@ class Handler(BaseHTTPRequestHandler):
             cursor = (query.get("cursor") or [None])[0]
             devices = query.get("devices") or []
             statuses = query.get("statuses") or []
+            limit = int((query.get("limit") or ["20"])[0])
 
             if cursor is None:
                 items = PAGE_ONE
@@ -137,6 +158,7 @@ class Handler(BaseHTTPRequestHandler):
                 items = [i for i in items if i["device_id"] in devices]
             if statuses:
                 items = [i for i in items if i["filtering_info"]["filtering_status"] in statuses]
+            items = items[:limit]
 
             self._send(200, {"items": items, "pages": pages})
             return
@@ -158,6 +180,7 @@ class MockServer:
         return f"http://{host}:{port}"
 
     def __enter__(self) -> "MockServer":
+        REQUESTS.clear()
         self.thread.start()
         return self
 

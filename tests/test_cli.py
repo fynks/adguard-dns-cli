@@ -7,10 +7,11 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from agdns.api import AdGuardDNSClient, ApiError
 from agdns.cli import main
-from tests.mock_api import API_KEY, MockServer
+from tests.mock_api import API_KEY, REQUESTS, MockServer
 
 
 class CLITestCase(unittest.TestCase):
@@ -161,15 +162,74 @@ class TestBlocked(CLITestCase):
 
 class TestClient(CLITestCase):
     def test_bad_api_key(self):
-        client = AdGuardDNSClient(api_key="wrong", api_url=self.server.url)
-        with self.assertRaises(ApiError) as ctx:
-            client.list_devices()
+        with AdGuardDNSClient(api_key="wrong", api_url=self.server.url) as client:
+            with self.assertRaises(ApiError) as ctx:
+                client.list_devices()
         self.assertEqual(ctx.exception.status, 401)
 
     def test_resolve_device(self):
-        client = AdGuardDNSClient(api_key=API_KEY, api_url=self.server.url)
-        device = client.resolve_device("Living Room TV")
+        with AdGuardDNSClient(api_key=API_KEY, api_url=self.server.url) as client:
+            device = client.resolve_device("Living Room TV")
         self.assertEqual(device.id, "dev222")
+
+    def test_device_list_is_fetched_once(self):
+        """Resolving several devices must not re-fetch the device list."""
+        with AdGuardDNSClient(api_key=API_KEY, api_url=self.server.url) as client:
+            with mock.patch.object(
+                AdGuardDNSClient, "_request", wraps=client._request
+            ) as spy:
+                client.resolve_device("My Phone")
+                client.resolve_device("Living Room TV")
+        paths = [c.args[0] for c in spy.call_args_list]
+        self.assertEqual(paths.count("/oapi/v2/devices"), 1)
+
+    def test_requests_use_gzip(self):
+        """Responses must be requested compressed to cut bandwidth."""
+        with AdGuardDNSClient(api_key=API_KEY, api_url=self.server.url) as client:
+            client.list_devices()
+        self.assertTrue(REQUESTS)
+        self.assertIn("gzip", REQUESTS[-1]["accept_encoding"])
+
+    def test_connection_is_reused(self):
+        """A keep-alive connection must be shared across requests."""
+        with AdGuardDNSClient(api_key=API_KEY, api_url=self.server.url) as client:
+            conns = []
+            original = client._transport.get
+
+            def spy(path, headers):
+                result = original(path, headers)
+                conns.append(id(client._transport._conn))
+                return result
+
+            client._transport.get = spy
+            client.list_devices()
+            client.list_devices()
+        self.assertEqual(len(conns), 2)
+        self.assertEqual(len(set(conns)), 1)
+
+    def test_page_size_capped_by_max_records(self):
+        """The API must not be asked for more rows than are wanted."""
+        with AdGuardDNSClient(api_key=API_KEY, api_url=self.server.url) as client:
+            list(
+                client.iter_query_log(
+                    time_from_millis=0,
+                    time_to_millis=1,
+                    max_items=1,
+                    limit=1000,
+                )
+            )
+        log_req = [r for r in REQUESTS if r["path"] == "/oapi/v1/query_log"][-1]
+        self.assertEqual(log_req["query"]["limit"], ["1"])
+
+    def test_retry_after_header_is_honoured(self):
+        """A 429 with Retry-After must pause instead of hammering."""
+        from agdns.api import _retry_delay
+
+        self.assertEqual(_retry_delay({"Retry-After": "3"}, 0), 3.0)
+        self.assertEqual(_retry_delay({"retry-after": "2"}, 0), 2.0)
+        self.assertEqual(_retry_delay({}, 0), 1.0)
+        self.assertEqual(_retry_delay({"Retry-After": "999"}, 0), 60.0)
+        self.assertEqual(_retry_delay({"Retry-After": "soon"}, 0), 1.0)
 
 
 if __name__ == "__main__":

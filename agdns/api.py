@@ -8,11 +8,12 @@ Only the endpoints needed by this CLI are implemented:
 
 from __future__ import annotations
 
+import gzip
+import http.client
 import json
 import time
 import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
@@ -99,6 +100,17 @@ class QueryLogItem:
         )
 
 
+def _retry_delay(headers: dict[str, str], attempt: int) -> float:
+    """Back-off delay before retrying, honouring ``Retry-After`` if sent."""
+    retry_after = headers.get("Retry-After") or headers.get("retry-after")
+    if retry_after:
+        try:
+            return min(float(retry_after), 60.0)
+        except ValueError:
+            pass
+    return min(2**attempt, 8)
+
+
 def _next_page_cursor(pages: list[dict[str, Any]]) -> str | None:
     """Pick the cursor of the page following the current one.
 
@@ -128,6 +140,67 @@ def _next_page_cursor(pages: list[dict[str, Any]]) -> str | None:
     return str(cursor) if cursor else None
 
 
+class _Transport:
+    """HTTP transport that reuses one connection and negotiates gzip.
+
+    A fresh TLS handshake per request is expensive when pulling a long query
+    log, and the JSON payloads compress by roughly 20x.  This keeps a single
+    connection alive across requests and asks the server for gzip.
+    """
+
+    def __init__(self, base_url: str, timeout: float) -> None:
+        parts = urllib.parse.urlsplit(base_url)
+        self.scheme = parts.scheme or "https"
+        self.host = parts.hostname or "api.adguard-dns.io"
+        self.port = parts.port
+        self.prefix = parts.path.rstrip("/")
+        self.timeout = timeout
+        self._conn: http.client.HTTPConnection | None = None
+
+    def _connection(self) -> http.client.HTTPConnection:
+        if self._conn is None:
+            if self.scheme == "https":
+                self._conn = http.client.HTTPSConnection(
+                    self.host, self.port, timeout=self.timeout
+                )
+            else:
+                self._conn = http.client.HTTPConnection(
+                    self.host, self.port, timeout=self.timeout
+                )
+        return self._conn
+
+    def close(self) -> None:
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+
+    def get(self, path: str, headers: dict[str, str]) -> tuple[int, bytes, dict[str, str]]:
+        """Perform a GET request, returning the status code, body and headers.
+
+        Retries once on a dropped keep-alive connection, since the server may
+        close an idle connection between requests.
+        """
+        target = f"{self.prefix}{path}"
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            conn = self._connection()
+            try:
+                conn.request("GET", target, headers=headers)
+                response = conn.getresponse()
+                body = response.read()
+                if response.getheader("Content-Encoding", "").lower() == "gzip":
+                    body = gzip.decompress(body)
+                return response.status, body, dict(response.getheaders())
+            except (http.client.HTTPException, OSError) as exc:
+                # The pooled connection may have been closed by the server.
+                self.close()
+                last_exc = exc
+                if attempt == 0:
+                    continue
+                raise urllib.error.URLError(last_exc) from exc
+        raise urllib.error.URLError(last_exc)
+
+
 class AdGuardDNSClient:
     """Minimal AdGuard DNS API client."""
 
@@ -144,6 +217,17 @@ class AdGuardDNSClient:
         self.timeout = timeout
         self.retries = max(1, retries)
         self.account_id = account_id
+        self._transport = _Transport(self.api_url, timeout)
+        self._devices_cache: list[Device] | None = None
+
+    def close(self) -> None:
+        self._transport.close()
+
+    def __enter__(self) -> "AdGuardDNSClient":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     # -- plumbing ---------------------------------------------------------
 
@@ -151,6 +235,8 @@ class AdGuardDNSClient:
         headers = {
             "Authorization": f"ApiKey {self.api_key}",
             "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "Connection": "keep-alive",
             "User-Agent": "agdns-cli/1.0",
         }
         if self.account_id is not None:
@@ -158,7 +244,6 @@ class AdGuardDNSClient:
         return headers
 
     def _request(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        url = f"{self.api_url}{path}"
         if params:
             # ``None`` values are skipped, lists are repeated (Go style).
             pairs: list[tuple[str, str]] = []
@@ -172,43 +257,40 @@ class AdGuardDNSClient:
                     pairs.append((key, str(value)))
             query = urllib.parse.urlencode(pairs)
             if query:
-                url = f"{url}?{query}"
+                path = f"{path}?{query}"
 
         last_error: Exception | None = None
         for attempt in range(self.retries):
-            request = urllib.request.Request(url, headers=self._headers(), method="GET")
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                    payload = response.read()
-                    if not payload:
-                        return None
-                    return json.loads(payload.decode("utf-8"))
-            except urllib.error.HTTPError as exc:
-                body = ""
-                try:
-                    body = exc.read().decode("utf-8", errors="replace")
-                except OSError:
-                    pass
-
-                if exc.code in (401, 403):
-                    raise ApiError(
-                        exc.code,
-                        "Authentication failed: check your API key and account permissions.",
-                        body,
-                    ) from exc
-                if exc.code == 404:
-                    raise ApiError(exc.code, f"Endpoint not found: {path}", body) from exc
-                if exc.code == 429 or exc.code >= 500:
-                    last_error = ApiError(exc.code, f"API request failed ({exc.code}).", body)
-                else:
-                    raise ApiError(exc.code, f"API request failed ({exc.code}).", body) from exc
+                status, raw, resp_headers = self._transport.get(path, self._headers())
             except urllib.error.URLError as exc:
                 last_error = exc
+                if attempt < self.retries - 1:
+                    time.sleep(min(2**attempt, 8))
+                    continue
+                break
 
-            if attempt < self.retries - 1:
-                time.sleep(min(2**attempt, 8))
-                continue
-            break
+            if status == 200:
+                if not raw:
+                    return None
+                return json.loads(raw.decode("utf-8"))
+
+            body = raw.decode("utf-8", errors="replace")
+            if status in (401, 403):
+                raise ApiError(
+                    status,
+                    "Authentication failed: check your API key and account permissions.",
+                    body,
+                )
+            if status == 404:
+                raise ApiError(status, f"Endpoint not found: {path}", body)
+            if status == 429 or status >= 500:
+                last_error = ApiError(status, f"API request failed ({status}).", body)
+                if attempt < self.retries - 1:
+                    time.sleep(_retry_delay(resp_headers, attempt))
+                    continue
+                raise last_error
+            raise ApiError(status, f"API request failed ({status}).", body)
 
         if isinstance(last_error, ApiError):
             raise last_error
@@ -234,13 +316,19 @@ class AdGuardDNSClient:
                 break
         return devices
 
+    def all_devices(self) -> list[Device]:
+        """Return every device, fetching the list only once per client."""
+        if self._devices_cache is None:
+            self._devices_cache = self.list_devices()
+        return self._devices_cache
+
     def find_devices_by_name(self, name: str) -> list[Device]:
         """Return devices matching ``name``.
 
         Exact (case-sensitive) name matches win over case-insensitive ones.
         A device ID is also accepted and always resolves to that device.
         """
-        all_devices = self.list_devices()
+        all_devices = self.all_devices()
 
         by_id = [d for d in all_devices if d.id == name]
         if by_id:
@@ -277,6 +365,10 @@ class AdGuardDNSClient:
         max_items: int | None = None,
     ) -> Iterator[QueryLogItem]:
         """Yield query log entries, transparently following pagination cursors."""
+        # Never ask for more rows than the caller intends to keep.
+        if max_items is not None:
+            limit = max(1, min(limit, max_items))
+
         cursor: str | None = None
         seen_cursors: set[str] = set()
         produced = 0
