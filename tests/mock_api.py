@@ -83,6 +83,41 @@ PAGE_TWO = [
     _item("banner.example.net", "dev111", 1714567200000, "REQUEST_BLOCKED"),
 ]
 
+# Extra entries so the domain-stats endpoint has allowed traffic to contrast
+# with blocked traffic, and a second device to exercise the devices filter.
+EXTRA_ITEMS = [
+    _item("cnn.com", "dev111", 1714570800000, "RESPONSE_ALLOWED"),
+    _item("ads.example.com", "dev222", 1714574400000, "REQUEST_BLOCKED"),
+    _item("tracker.example.com", "dev222", 1714578000000, "RESPONSE_BLOCKED"),
+    _item("clean.example.com", "dev222", 1714581600000, "RESPONSE_ALLOWED"),
+]
+
+# Everything the stats endpoint aggregates from.
+ALL_LOG_ITEMS = PAGE_ONE + PAGE_TWO + EXTRA_ITEMS
+
+
+def _aggregate_domain_stats(items: list[dict]) -> list[dict]:
+    """Reduce log entries to per-domain aggregate stats, like the real API."""
+    buckets: dict[str, dict] = {}
+    for item in items:
+        key = item["domain"]
+        bucket = buckets.setdefault(
+            key,
+            {
+                "domain": item["domain"],
+                "value": {"blocked": 0, "queries": 0, "companies": 1},
+            },
+        )
+        bucket["value"]["queries"] += 1
+        if item["filtering_info"]["filtering_status"] in (
+            "REQUEST_BLOCKED",
+            "RESPONSE_BLOCKED",
+        ):
+            bucket["value"]["blocked"] += 1
+    stats = list(buckets.values())
+    stats.sort(key=lambda s: (-s["value"]["queries"], s["domain"]))
+    return stats
+
 
 class Handler(BaseHTTPRequestHandler):
     # HTTP/1.1 enables keep-alive, matching the real API.
@@ -159,6 +194,21 @@ class Handler(BaseHTTPRequestHandler):
             items = items[:limit]
 
             self._send(200, {"items": items, "pages": pages})
+            return
+
+        if parsed.path == "/oapi/v1/stats/domains":
+            cursor = (query.get("cursor") or [None])[0]
+            devices = query.get("devices") or []
+            limit = int((query.get("limit") or ["20"])[0])
+
+            # Only one page of mock data; any cursor yields nothing, matching
+            # the "filtering parameters must be repeated per page" contract.
+            items = ALL_LOG_ITEMS if cursor is None else []
+            if devices:
+                items = [i for i in items if i["device_id"] in devices]
+            items = _aggregate_domain_stats(items)[:limit]
+
+            self._send(200, {"stats": items, "navigation": {}})
             return
 
         self._send(404, {"message": "not found"})

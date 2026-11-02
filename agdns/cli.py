@@ -1,7 +1,6 @@
 """Command line interface for the AdGuard DNS CLI."""
 
 import argparse
-import csv
 import json
 import os
 import sys
@@ -105,49 +104,6 @@ def _print_table(items: Sequence[QueryLogItem]) -> None:
         print(line(row))
 
 
-CSV_HEADER = [
-    "time_iso",
-    "time_millis",
-    "domain",
-    "device_id",
-    "status",
-    "category",
-    "company",
-    "filter_id",
-    "filter_rule",
-    "filtering_category_id",
-    "blocked_service_id",
-    "client_country",
-    "response_country",
-]
-
-
-def _csv_row(item: QueryLogItem) -> list[Any]:
-    return [
-        item.time_iso,
-        item.time_millis,
-        item.domain,
-        item.device_id,
-        item.filtering_status,
-        item.category_type,
-        item.company_id,
-        item.filter_id,
-        item.filter_rule,
-        item.filtering_category_id,
-        item.blocked_service_id,
-        item.client_country,
-        item.response_country,
-    ]
-
-
-def _print_csv(items: Iterable[QueryLogItem], stream: Any) -> None:
-    """Write CSV rows as they arrive, so memory stays flat."""
-    writer = csv.writer(stream)
-    writer.writerow(CSV_HEADER)
-    for item in items:
-        writer.writerow(_csv_row(item))
-
-
 def _print_json(payload: Any, stream: Any) -> None:
     json.dump(payload, stream, indent=2, ensure_ascii=False)
     stream.write("\n")
@@ -244,14 +200,7 @@ def cmd_devices(args: argparse.Namespace) -> int:
 def cmd_blocked(args: argparse.Namespace) -> int:
     client = _client(args)
     time_from, time_to = _time_range(args)
-
-    device_ids: list[str] = []
-    devices_info: list[Device] = []
-    for name in args.device:
-        device = client.resolve_device(name)
-        devices_info.append(device)
-        if device.id not in device_ids:
-            device_ids.append(device.id)
+    device_ids, devices_info = _resolve_devices(client, args.device)
 
     statuses = args.status if args.status else list(BLOCKED_STATUSES)
     records = client.iter_query_log(
@@ -263,12 +212,6 @@ def cmd_blocked(args: argparse.Namespace) -> int:
         limit=args.page_size,
         max_items=args.max_records,
     )
-
-    if args.format == "csv":
-        # Stream straight to disk: memory stays flat regardless of log size.
-        _print_csv(records, sys.stdout)
-        client.close()
-        return 0
 
     acc = _Accumulator()
     items: list[QueryLogItem] = []
@@ -293,7 +236,7 @@ def cmd_blocked(args: argparse.Namespace) -> int:
         _print_json(payload, sys.stdout)
         return 0
 
-    # table
+    # Table
     device_label = ", ".join(d.name for d in devices_info)
     print(
         f"Blocked queries for {device_label} "
@@ -311,6 +254,44 @@ def cmd_blocked(args: argparse.Namespace) -> int:
         print("Top domains:")
         for name, count in list(summary["by_domain"].items())[:20]:
             print(f"  {count:>6}  {name}")
+    return 0
+
+
+def _resolve_devices(client: AdGuardDNSClient, names: list[str]) -> tuple[list[str], list[Device]]:
+    """Resolve device names/IDs to unique IDs plus their Device records."""
+    device_ids: list[str] = []
+    devices_info: list[Device] = []
+    for name in names:
+        device = client.resolve_device(name)
+        devices_info.append(device)
+        if device.id not in device_ids:
+            device_ids.append(device.id)
+    return device_ids, devices_info
+
+
+def cmd_blocklist(args: argparse.Namespace) -> int:
+    """Emit the list of domains blocked for one or more devices.
+
+    Uses the aggregated domain statistics endpoint, so the output stays tiny
+    compared to a full query-log pull: one domain per line, nothing else.
+    """
+    client = _client(args)
+    time_from, time_to = _time_range(args)
+    device_ids, _ = _resolve_devices(client, args.device)
+
+    domains = (
+        stat.domain
+        for stat in client.iter_domain_stats(
+            time_from_millis=time_from,
+            time_to_millis=time_to,
+            devices=device_ids,
+            limit=args.page_size,
+        )
+        if stat.blocked > 0
+    )
+    for domain in domains:
+        sys.stdout.write(f"{domain}\n")
+    client.close()
     return 0
 
 
@@ -376,9 +357,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     blocked.add_argument("--summary", action="store_true", help="Print aggregate statistics.")
     blocked.add_argument(
-        "--format", choices=("table", "json", "csv"), default="table", help="Output format."
+        "--format", choices=("table", "json"), default="table", help="Output format."
     )
     blocked.set_defaults(func=cmd_blocked)
+
+    blocklist = subparsers.add_parser(
+        "blocklist",
+        help="Print the domains blocked for one or more devices, one per line.",
+        description=(
+            "Export the domains blocked for one or more devices, deduplicated, "
+            "one domain per line, using the aggregated domain-statistics "
+            "endpoint."
+        ),
+    )
+    blocklist.add_argument("device", nargs="+", help="Device name or device ID.")
+    blocklist.add_argument(
+        "--days", type=int, default=DEFAULT_DAYS, help="Look back this many days (default: 30)."
+    )
+    blocklist.add_argument("--since", help="Start of the range (YYYY-MM-DD or ISO-8601).")
+    blocklist.add_argument("--until", help="End of the range (YYYY-MM-DD or ISO-8601).")
+    blocklist.add_argument(
+        "--page-size", type=int, default=1000, help="Entries per API request (max 1000)."
+    )
+    blocklist.set_defaults(func=cmd_blocklist)
 
     return parser
 

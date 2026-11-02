@@ -102,13 +102,6 @@ class TestBlocked(CLITestCase):
         self.assertIn("ads.example.com", out)
         self.assertIn("DOMAIN", out)
 
-    def test_blocked_csv_output(self):
-        self.set_key()
-        code, out, _ = self.run_cli("blocked", "My Phone", "--format", "csv")
-        lines = out.strip().splitlines()
-        self.assertEqual(len(lines), 4)
-        self.assertTrue(lines[0].startswith("time_iso,"))
-
     def test_max_records(self):
         self.set_key()
         code, out, _ = self.run_cli(
@@ -156,6 +149,50 @@ class TestBlocked(CLITestCase):
         items = json.loads(out)["items"]
         self.assertTrue(all(i["filtering_info"]["filtering_status"] == "REQUEST_BLOCKED" for i in items))
         self.assertEqual(len(items), 2)
+
+
+class TestBlocklist(CLITestCase):
+    """The blocklist command must print one deduplicated domain per line."""
+
+    def test_plain_domain_list(self):
+        self.set_key()
+        code, out, _ = self.run_cli("blocklist", "My Phone")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            sorted(out.strip().splitlines()),
+            sorted(["ads.example.com", "track.example.org", "banner.example.net"]),
+        )
+
+    def test_allowed_domains_are_excluded(self):
+        """Domains never blocked must not appear in the list."""
+        self.set_key()
+        code, out, _ = self.run_cli("blocklist", "My Phone")
+        self.assertEqual(code, 0)
+        self.assertNotIn("cnn.com", out)
+
+    def test_devices_filter_is_sent(self):
+        self.set_key()
+        self.run_cli("blocklist", "Living Room TV")
+        stats_reqs = [r for r in REQUESTS if r["path"] == "/oapi/v1/stats/domains"]
+        self.assertTrue(stats_reqs)
+        self.assertEqual(stats_reqs[-1]["query"]["devices"], ["dev222"])
+
+    def test_only_one_device_shows_only_its_domains(self):
+        self.set_key()
+        code, out, _ = self.run_cli("blocklist", "Living Room TV")
+        self.assertEqual(code, 0)
+        self.assertNotIn("banner.example.net", out)
+
+    def test_multiple_devices_merge(self):
+        self.set_key()
+        code, out, _ = self.run_cli("blocklist", "My Phone", "Living Room TV")
+        self.assertEqual(code, 0)
+        domains = out.strip().splitlines()
+        # Blocked sets from both devices merge into one deduplicated list:
+        # ads.example.com is blocked by both devices and appears once.
+        self.assertEqual(domains.count("ads.example.com"), 1)
+        self.assertIn("tracker.example.com", domains)
+        self.assertIn("banner.example.net", domains)
 
 
 class TestClient(CLITestCase):

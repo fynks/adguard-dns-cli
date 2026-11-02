@@ -2,8 +2,9 @@
 
 Only the endpoints needed by this CLI are implemented:
 
-- ``GET /oapi/v2/devices``   -- list / search devices by name or ID.
-- ``GET /oapi/v1/query_log`` -- fetch query log entries for a time range.
+- ``GET /oapi/v2/devices``       -- list / search devices by name or ID.
+- ``GET /oapi/v1/query_log``     -- fetch query log entries for a time range.
+- ``GET /oapi/v1/stats/domains`` -- per-domain query counts, including blocked.
 """
 
 import gzip
@@ -98,6 +99,28 @@ class QueryLogItem:
             blocked_service_id=str(info.get("blocked_service_id") or ""),
             client_country=str(data.get("client_country") or ""),
             response_country=str(data.get("response_country") or ""),
+            raw=data,
+        )
+
+
+@dataclass
+class DomainStats:
+    """Aggregated query statistics for one domain."""
+
+    domain: str
+    queries: int
+    blocked: int
+    companies: int
+    raw: JsonObject = field(default_factory=dict)
+
+    @classmethod
+    def from_json(cls, data: JsonObject) -> DomainStats:
+        value = data.get("value") or {}
+        return cls(
+            domain=str(data.get("domain") or ""),
+            queries=int(value.get("queries") or 0),
+            blocked=int(value.get("blocked") or 0),
+            companies=int(value.get("companies") or 0),
             raw=data,
         )
 
@@ -403,3 +426,55 @@ class AdGuardDNSClient:
                 return
             seen_cursors.add(next_cursor)
             cursor = next_cursor
+
+    # -- domain statistics -------------------------------------------------
+
+    def iter_domain_stats(
+        self,
+        time_from_millis: int,
+        time_to_millis: int,
+        devices: list[str] | None = None,
+        dns_servers: list[str] | None = None,
+        countries: list[str] | None = None,
+        limit: int = DEFAULT_PAGE_LIMIT,
+        max_items: int | None = None,
+    ) -> Iterator[DomainStats]:
+        """Yield per-domain query statistics, transparently following cursors.
+
+        Entries are arranged by total query count; the ``blocked`` attribute
+        counts how many of the domain's queries were filtered away.
+        """
+        # Never ask for more rows than the caller intends to keep.
+        if max_items is not None:
+            limit = max(1, min(limit, max_items))
+
+        cursor: str | None = None
+        produced = 0
+        while True:
+            data = self._request(
+                "/oapi/v1/stats/domains",
+                {
+                    "time_from_millis": time_from_millis,
+                    "time_to_millis": time_to_millis,
+                    "devices": devices,
+                    "dns_servers": dns_servers,
+                    "countries": countries,
+                    "limit": limit,
+                    "cursor": cursor,
+                },
+            )
+            items = (data or {}).get("stats") or []
+            for item in items:
+                yield DomainStats.from_json(item)
+                produced += 1
+                if max_items is not None and produced >= max_items:
+                    return
+
+            if not items:
+                return
+
+            navigation = (data or {}).get("navigation") or {}
+            nxt = navigation.get("next") or {}
+            cursor = nxt.get("page_cursor")
+            if not cursor:
+                return
