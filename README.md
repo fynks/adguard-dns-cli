@@ -1,33 +1,36 @@
 # agdns-cli
 
-A small CLI to pull **blocked DNS requests per device** from the [AdGuard DNS API](https://adguard-dns.io/kb/private-dns/api/overview).
+A small CLI that pulls filtering data from the [AdGuard DNS API](https://adguard-dns.io/kb/private-dns/api/overview/):
 
-The API key is stored locally (file mode `0600`), and the tool fetches every blocked
-query for a given device over the past 30 days (configurable), following pagination
-cursors automatically.
+- `blocklist`: the blocked domains for a device, deduplicated, one per line.
+  Ready to combine with other lists, e.g. to build hosts-format blocklists.
+- `blocked`: every blocked query for a device with timestamp, domain, filter
+  rule, and status, for detail over short ranges.
+
+It has no third-party dependencies. The API key is stored locally with file
+mode `0600`. Requests reuse one keep-alive connection, ask for gzip, and
+follow pagination cursors automatically.
 
 ## Requirements
 
 - Python 3.12+
-- An AdGuard DNS account (Private DNS) with an API key
-- Query log access on the account
+- An AdGuard DNS (Private DNS) account with an API key
 
 ## Install
 
 ### Arch / EndeavourOS
 
-Python 3.14 is already provided by `core/python`, and this tool has **no third-party
-dependencies**, so nothing extra is required. Because Arch's system Python is
-"externally managed" (PEP 668), use `pipx` to install the command:
+Python 3.14 already ships in `core/python`, and the tool has no third-party
+dependencies, so nothing extra is required. Because Arch's system Python is
+externally managed (PEP 668), use `pipx`:
 
 ```bash
-yay -S python-pipx
+yay -S python-pipx          # only if pipx is not installed yet
 pipx install .
 agdns --help
 ```
 
-The command lands in `~/.local/bin` .
-
+The command lands in `~/.local/bin` (already on `PATH` on EndeavourOS).
 To reinstall after editing the code:
 
 ```bash
@@ -37,27 +40,24 @@ pipx install --force .
 ### Other platforms
 
 ```bash
-pip install -e .           
-```
-
-Or run it without installing:
-
-```bash
+pip install -e .            # or: pipx install .
+# or run it without installing:
 python -m agdns --help
 ```
 
 ## Setup
 
-Create an API key in *AdGuard DNS → User preferences → API keys*, then:
+Create an API key in the AdGuard DNS dashboard: *User preferences*, *API keys*.
+Then:
 
 ```bash
 agdns config set-key <API_KEY>
-agdns config show 
+agdns config show          # confirm it was saved
 ```
 
-The key is written to `~/.config/agdns-cli/config.json` (override the directory with
-`AGDNS_CONFIG_DIR`, or `XDG_CONFIG_HOME`). `AGDNS_API_KEY` takes precedence over the
-file if set.
+The key is written to `~/.config/agdns-cli/config.json`. Override the directory
+with `AGDNS_CONFIG_DIR` or `XDG_CONFIG_HOME`. The `AGDNS_API_KEY` environment
+variable takes precedence over the file.
 
 ## Usage
 
@@ -65,84 +65,89 @@ file if set.
 # List devices and their IDs
 agdns devices
 agdns devices --search phone
+agdns devices --format json
 
-# Blocked requests for a device over the last 30 days (default)
+# Blocked domains for a device: deduplicated, one per line (default: last 30 days)
+agdns blocklist "My Phone" > myphone-blocklist.txt
+agdns blocklist "My Phone" --days 7
+agdns blocklist "My Phone" "Living Room TV"        # several devices, merged
+
+# Detail view: every blocked query with timestamps and rules
 agdns blocked "My Phone"
-
-# Explicit time range and extra filters
 agdns blocked "My Phone" --days 7
 agdns blocked "My Phone" --since 2024-05-01 --until 2024-05-31
-agdns blocked "My Phone" --search ads.          # only domains matching "ads."
+agdns blocked "My Phone" --search ads.             # only domains matching "ads."
 agdns blocked "My Phone" --max-records 500
-
-# Output formats
 agdns blocked "My Phone" --format json > blocked.json
+agdns blocked "My Phone" --summary                 # per-category and per-domain totals
 
-# Aggregate view
-agdns blocked "My Phone" --summary
-
-# Several devices at once, or by device ID
-agdns blocked "My Phone" "Living Room TV"
-agdns blocked dev111
-
-# Plain blocked-domain list, deduplicated, one domain per line
-agdns blocklist "My Phone" > blocked.txt
-agdns blocklist "My Phone" "Living Room TV"   # merged, deduplicated
+# By device ID instead of name
+agdns blocklist dev111
+agdns blocked dev111 --format json
 ```
 
-Device names are matched case-sensitively first; if that is ambiguous the CLI errors
-out and lists the candidates so you can pass the device ID instead.
-
-Time-range notes: bare dates (`--since 2024-05-01`) are interpreted as midnight
-UTC, not the machine's local zone. `--days` must be 1 or more, and the start of
-the range must not come after its end.
+Device names match case-sensitively first. If a name is ambiguous, the CLI
+errors out and lists the candidates so you can pass the device ID instead.
 
 ## Commands
 
 | Command | Description |
 | --- | --- |
 | `agdns devices` | List devices (`--search`, `--format`) |
-| `agdns blocked <device>...` | Blocked requests for one or more devices |
 | `agdns blocklist <device>...` | Deduplicated blocked domains, one per line |
+| `agdns blocked <device>...` | Blocked requests with full detail |
 | `agdns config set-key <key>` | Store the API key locally |
-| `agdns config set-url <url>` | Override the API base URL (for testing/proxies) |
+| `agdns config set-url <url>` | Override the API base URL (for testing or proxies) |
 | `agdns config show` | Show the current configuration |
 | `agdns config clear-key` | Remove the stored API key |
+
+### `blocklist` options
+
+Uses the aggregated per-domain statistics endpoint, so it is much lighter than
+pulling every log entry. Multi-device runs merge into one list; the API
+aggregates per domain, so no sorting or `uniq` is needed afterward.
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `--days N` | `30` | Look back N days |
+| `--since` / `--until` | – | Explicit range (see below) |
+| `--page-size N` | `1000` | Entries per API request (max 1000) |
 
 ### `blocked` options
 
 | Option | Default | Description |
 | --- | --- | --- |
 | `--days N` | `30` | Look back N days |
-| `--since` / `--until` | – | Explicit range (`YYYY-MM-DD` or ISO-8601) |
-| `--status` | blocked only | repeatable filtering statuses |
+| `--since` / `--until` | – | Explicit range (see below) |
+| `--status` | `REQUEST_BLOCKED`, `RESPONSE_BLOCKED` | Filtering status to include (repeatable). Other values: `REQUEST_ALLOWED`, `RESPONSE_ALLOWED`, `MODIFIED`, `NONE` |
 | `--search` | – | Domain substring filter |
+| `--max-records N` | unlimited | Stop after N entries |
 | `--page-size N` | `1000` | Entries per API request (max 1000) |
 | `--summary` | off | Print per-category and per-domain totals |
 | `--format` | `table` | `table` or `json` |
 
-### `blocklist` options
+### Time ranges
 
-The `blocklist` command is the cheap path to "which domains got blocked":
-it uses aggregated per-domain statistics instead of pulling every log entry,
-and prints just the list of blocked domains, one per line — ready to be
-combined with other lists (e.g. to build hosts-format blocklists elsewhere).
+`--days`, `--since`, and `--until` work the same way on `blocklist` and
+`blocked`:
 
-| Option | Default | Description |
-| --- | --- | --- |
-| `--days N` / `--since` / `--until` | `30` | Same time range options as `blocked` |
-| `--page-size N` | `1000` | Entries per API request (max 1000) |
+- `--since` / `--until` accept `YYYY-MM-DD`, ISO 8601 timestamps
+  (`2024-05-01T10:00:00Z`), or epoch seconds (`1714560000`).
+- A bare date means midnight UTC, not the machine's local zone.
+- The range is validated: `--days` must be 1 or more, and the start must not
+  come after the end.
 
-## API used
+## API endpoints
 
-- `GET /oapi/v2/devices` — resolve a device name to its ID
-- `GET /oapi/v1/query_log` — fetch entries for the time range, filtered by
-  `devices` and `statuses` (`blocked` command)
-- `GET /oapi/v1/stats/domains` — aggregated per-domain query counts filtered by
-  `devices`; entries with `blocked > 0` form the blocklist (`blocklist` command)
+Every request is authenticated with an `Authorization: ApiKey <key>` header.
+Pass `--account-id` (before the subcommand) to operate on a specific account,
+sent as the `X-Account-Id` header.
 
-Authentication is the `Authorization: ApiKey <key>` header. Use `--account-id` to
-operate on a specific account (`X-Account-Id`).
+- `GET /oapi/v2/devices`: resolve device names to IDs
+- `GET /oapi/v1/stats/domains`: aggregated per-domain query counts, filtered
+  by devices; entries with `blocked > 0` form the `blocklist` output
+- `GET /oapi/v1/query_log`: per-query detail for a time range, filtered by
+  devices and statuses; used by `blocked`
 
 ## Tests
 
@@ -150,5 +155,5 @@ operate on a specific account (`X-Account-Id`).
 python -m unittest discover -s tests -t .
 ```
 
-The suite runs against a local mock of the AdGuard DNS API, so no network or real
-credentials are needed.
+The suite runs against a local mock of the AdGuard DNS API, so no network or
+real credentials are needed.
