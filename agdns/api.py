@@ -327,6 +327,7 @@ class AdGuardDNSClient:
         """List devices, optionally filtered by a name/ID search term."""
         devices: list[Device] = []
         cursor: str | None = None
+        seen_cursors: set[str] = set()
         while True:
             data = self._request(
                 "/oapi/v2/devices",
@@ -337,8 +338,9 @@ class AdGuardDNSClient:
             navigation = (data or {}).get("navigation") or {}
             nxt = navigation.get("next") or {}
             cursor = nxt.get("page_cursor")
-            if not cursor:
+            if not cursor or cursor in seen_cursors:
                 break
+            seen_cursors.add(cursor)
         return devices
 
     def all_devices(self) -> list[Device]:
@@ -449,6 +451,7 @@ class AdGuardDNSClient:
             limit = max(1, min(limit, max_items))
 
         cursor: str | None = None
+        seen_cursors: set[str] = set()
         produced = 0
         while True:
             data = self._request(
@@ -476,5 +479,6 @@ class AdGuardDNSClient:
             navigation = (data or {}).get("navigation") or {}
             nxt = navigation.get("next") or {}
             cursor = nxt.get("page_cursor")
-            if not cursor:
+            if not cursor or cursor in seen_cursors:
                 return
+            seen_cursors.add(cursor)

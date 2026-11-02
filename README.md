@@ -93,6 +93,10 @@ agdns blocklist "My Phone" "Living Room TV"   # merged, deduplicated
 Device names are matched case-sensitively first; if that is ambiguous the CLI errors
 out and lists the candidates so you can pass the device ID instead.
 
+Time-range notes: bare dates (`--since 2024-05-01`) are interpreted as midnight
+UTC, not the machine's local zone. `--days` must be 1 or more, and the start of
+the range must not come after its end.
+
 ## Commands
 
 | Command | Description |

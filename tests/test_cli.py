@@ -183,6 +183,61 @@ class TestBlocklist(CLITestCase):
         self.assertEqual(code, 0)
         self.assertNotIn("banner.example.net", out)
 
+    def test_repeated_cursor_terminates(self):
+        """A server echoing back the same cursor must not hang the client.
+
+        One duplicate page is tolerated (it is only detectable as a repeat
+        after it has been served); the important guarantee is termination.
+        """
+        with AdGuardDNSClient(api_key=API_KEY, api_url=self.server.url) as client:
+            with mock.patch.object(
+                AdGuardDNSClient, "_request", autospec=True
+            ) as fake:
+                fake.return_value = {
+                    "stats": [
+                        {"domain": "ads.example.com", "value": {"queries": 2, "blocked": 1}}
+                    ],
+                    "navigation": {"next": {"page_cursor": "same-forever"}},
+                }
+                stats = list(client.iter_domain_stats(0, 1))
+        self.assertTrue(stats)
+        self.assertLess(len(stats), 10)
+        self.assertLess(fake.call_count, 10)
+
+    def test_zero_days_is_rejected(self):
+        self.set_key()
+        code, _, err = self.run_cli("blocklist", "My Phone", "--days", "0")
+        self.assertEqual(code, 1)
+        self.assertIn("--days", err)
+
+    def test_start_after_end_is_rejected(self):
+        self.set_key()
+        code, _, err = self.run_cli(
+            "blocklist", "My Phone", "--since", "2025-06-01", "--until", "2025-05-01"
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("start is after the end", err)
+
+    def test_bare_dates_are_interpreted_as_utc(self):
+        """A bare YYYY-MM-DD must not shift with the machine's local zone."""
+        import time as time_mod
+
+        from agdns.cli import _parse_time
+
+        old_tz = os.environ.get("TZ")
+        try:
+            os.environ["TZ"] = "America/New_York"
+            time_mod.tzset()
+            bare = _parse_time("2025-05-01")
+            explicit = _parse_time("2025-05-01T00:00:00+00:00")
+            self.assertEqual(bare, explicit)
+        finally:
+            if old_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old_tz
+            time_mod.tzset()
+
     def test_multiple_devices_merge(self):
         self.set_key()
         code, out, _ = self.run_cli("blocklist", "My Phone", "Living Room TV")

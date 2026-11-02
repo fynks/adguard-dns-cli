@@ -47,11 +47,15 @@ def _client(args: argparse.Namespace) -> AdGuardDNSClient:
 
 def _time_range(args: argparse.Namespace) -> tuple[int, int]:
     now = datetime.now(UTC)
+    if not args.since and args.days < 1:
+        raise CliError("--days must be 1 or more.")
     if args.since:
         start = _parse_time(args.since)
     else:
         start = now - timedelta(days=args.days)
     end = _parse_time(args.until) if args.until else now
+    if start > end:
+        raise CliError("The time range is empty: the start is after the end.")
     return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
 
 
@@ -62,9 +66,14 @@ def _parse_time(value: str) -> datetime:
         return datetime.fromtimestamp(seconds, tz=UTC)
     try:
         # Python 3.11+ parses both "Z" and "+00:00" suffixes natively.
-        return datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value)
     except ValueError as exc:
-        raise SystemExit(f'Invalid time "{value}". Use YYYY-MM-DD or an ISO-8601 timestamp.') from exc
+        raise CliError(f'Invalid time "{value}". Use YYYY-MM-DD or an ISO-8601 timestamp.') from exc
+    # Bare dates carry no zone; the API works in epoch millis, so anchor
+    # them to UTC instead of letting timestamp() use the local zone.
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
 
 
 def _fmt_time(millis: int) -> str:
